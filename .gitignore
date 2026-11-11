@@ -2,9 +2,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+outputs/
+runs/
 checkpoints/
 test_predictions/
 evaluation/
+*.pt
+*.pth
+*.npz
 *.tmp
 *.log
 EXP-*/

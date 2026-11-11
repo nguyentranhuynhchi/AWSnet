@@ -209,84 +209,49 @@ class TestCLIParserExhaustion(unittest.TestCase):
 
 
 class TestScriptSyntaxAndLinting(unittest.TestCase):
-    """Test 2: Bash syntax, linting, quote matching, and embedded Python AST parsing."""
+    """Test 2: Bash syntax, linting, quote matching, and cleanup verification for environment_awsnet.sh."""
 
     def setUp(self):
-        self.train_env_path = PROJECT_ROOT / "Environment_A100_5seeds_AWSnet.txt"
-        self.eval_env_path = PROJECT_ROOT / "Environment_Eval_5seeds_AWSnet.txt"
-        self.assertTrue(self.train_env_path.exists(), f"Missing {self.train_env_path}")
-        self.assertTrue(self.eval_env_path.exists(), f"Missing {self.eval_env_path}")
-        self.train_content = self.train_env_path.read_text(encoding="utf-8")
-        self.eval_content = self.eval_env_path.read_text(encoding="utf-8")
+        self.env_script_path = REPO_ROOT / "environment_awsnet.sh"
+        self.assertTrue(self.env_script_path.exists(), f"Missing {self.env_script_path}")
+        self.env_content = self.env_script_path.read_text(encoding="utf-8")
+
+    def test_deprecated_env_txt_files_removed(self):
+        """Ensure cluttered legacy env .txt files were cleaned up from repo root."""
+        for legacy in (
+            "enveronment_AWSnet.txt",
+            "enveronment_2seeds_AWSnet.txt",
+            "Environment_A100_5seeds_AWSnet.txt",
+            "Environment_Eval_5seeds_AWSnet.txt",
+        ):
+            self.assertFalse((REPO_ROOT / legacy).exists(), f"Legacy env file should be removed: {legacy}")
 
     def test_bash_shebang_and_strict_mode(self):
-        """Verify scripts start with proper bash shebang and set -e."""
-        self.assertTrue(self.train_content.startswith("#!/bin/bash"))
-        self.assertTrue(self.eval_content.startswith("#!/bin/bash"))
-        self.assertIn("set -e", self.train_content)
-        self.assertIn("set -e", self.eval_content)
+        """Verify environment_awsnet.sh starts with proper bash shebang and set -e."""
+        self.assertTrue(self.env_content.startswith("#!/bin/bash"))
+        self.assertIn("set -e", self.env_content)
+        self.assertIn("nguyentranhuynhchi/AWSnet.git", self.env_content)
 
     def test_brackets_and_subshell_matching(self):
-        """Verify that brackets, braces, and parentheses balance in both scripts."""
-        for name, content in [("Train Env", self.train_content), ("Eval Env", self.eval_content)]:
-            # Check balanced brackets
-            counts = {
-                "(": content.count("("),
-                ")": content.count(")"),
-                "[": content.count("["),
-                "]": content.count("]"),
-                "{": content.count("{"),
-                "}": content.count("}"),
-            }
-            self.assertEqual(counts["("], counts[")"], f"Unbalanced () in {name}")
-            self.assertEqual(counts["["], counts["]"], f"Unbalanced [] in {name}")
-            self.assertEqual(counts["{"], counts["}"], f"Unbalanced {{}} in {name}")
-
-    def test_tmux_commands_integrity(self):
-        """Verify tmux commands in training environment script."""
-        # Should have kill-session, new-session, and new-window for 5 seeds
-        self.assertIn("tmux kill-session -t train5_awsnet", self.train_content)
-        self.assertIn("tmux new-session -d -s train5_awsnet", self.train_content)
-        self.assertIn("tmux new-window -t train5_awsnet", self.train_content)
-        # Verify 5 seeds
-        self.assertIn("SEEDS=(1234 1098 1024 2026 6868)", self.train_content)
-        self.assertIn("for i in {1..4}; do", self.train_content)
+        """Verify that brackets, braces, and parentheses balance in environment_awsnet.sh."""
+        counts = {
+            "(": self.env_content.count("("),
+            ")": self.env_content.count(")"),
+            "[": self.env_content.count("["),
+            "]": self.env_content.count("]"),
+            "{": self.env_content.count("{"),
+            "}": self.env_content.count("}"),
+        }
+        self.assertEqual(counts["("], counts[")"], "Unbalanced () in environment_awsnet.sh")
+        self.assertEqual(counts["["], counts["]"], "Unbalanced [] in environment_awsnet.sh")
+        self.assertEqual(counts["{"], counts["}"], "Unbalanced {} in environment_awsnet.sh")
 
     def test_inline_python_scripts_ast_parse(self):
-        """Extract and parse all inline python -c scripts with ast.parse."""
-        # 1. Drive mount script in Train Env
-        mount_match = re.search(r'python3\s+-c\s+"([^"]+)"', self.train_content)
+        """Extract and parse inline python -c snippets in environment_awsnet.sh with ast.parse."""
+        mount_match = re.search(r'python3\s+-c\s+"([^"]+)"', self.env_content)
         self.assertIsNotNone(mount_match, "Could not extract drive mount python snippet")
-        mount_code = mount_match.group(1)
-        try:
-            tree = ast.parse(mount_code)
-            self.assertIsNotNone(tree)
-        except SyntaxError as e:
-            self.fail(f"Drive mount inline script failed ast.parse: {e}")
-
-        # 2. Aggregator script in Eval Env
-        eval_match = re.search(r'python3\s+-c\s+"([\s\S]+?)"\s*$', self.eval_content)
-        self.assertIsNotNone(eval_match, "Could not extract eval aggregator python snippet")
-        raw_eval_code = eval_match.group(1)
-
-        # In bash execution, bash expands variables and unescapes \" inside double quotes
-        # Test simulated bash unquoting:
-        bash_expanded = raw_eval_code.replace('\\"', '"')
-        bash_expanded = bash_expanded.replace("$RUN_ROOT", "/content/drive/MyDrive/AWSnet_Runs")
-        bash_expanded = bash_expanded.replace("$MODEL_NAME", "awsnet")
-
-        try:
-            tree = ast.parse(bash_expanded)
-            self.assertIsNotNone(tree)
-        except SyntaxError as e:
-            self.fail(f"Eval aggregator inline script (bash-expanded) failed ast.parse: {e}")
-
-        # Also test raw script AST parsing across Python syntax versions
-        try:
-            tree_raw = ast.parse(raw_eval_code)
-            self.assertIsNotNone(tree_raw)
-        except SyntaxError as e:
-            print(f"[AST Warning] Raw code ast.parse note: {e}")
+        tree = ast.parse(mount_match.group(1))
+        self.assertIsNotNone(tree)
 
 
 class TestMetricParsingAggregatorResilience(unittest.TestCase):

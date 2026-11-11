@@ -18,6 +18,7 @@ Strictly adheres to:
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -36,8 +37,29 @@ from torch.utils.data import DataLoader
 from dataset.myops380_dataset import MyoPS380TrainDataset
 from models.awsnet import AWSnet
 from utils.criterions import AWSCompositeLoss, LossPRSnet_dicece
+from utils.efficiency import (
+    build_efficiency_payload,
+    check_rule_compliance,
+    count_parameters as count_efficiency_parameters,
+    measure_flops,
+    measure_inference_efficiency,
+    save_efficiency_report,
+    summarize_training_efficiency,
+    sync_if_cuda,
+)
 from utils.lr_scheduler import build_optimizer, build_scheduler, OPTIMIZATION_PROTOCOL
 from utils.paths import resolve_data_root, resolve_split_dir, resolve_save_dir
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for p in paths:
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            unique.append(p)
+    return unique
 
 
 def resolve_amp(mode: str, device: torch.device) -> Optional[torch.dtype]:
@@ -131,6 +153,7 @@ def train_epoch(
     skipped_steps = 0
 
     use_amp = (amp_dtype is not None and device.type == "cuda")
+    sync_if_cuda(device)
     t0 = time.perf_counter()
     num_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
 
@@ -217,6 +240,7 @@ def train_epoch(
                 f"Loss: {step_loss:.4f} | LR: {current_lr:.6f}"
             )
 
+    sync_if_cuda(device)
     elapsed = time.perf_counter() - t0
     avg_loss = epoch_loss / max(1, total_samples)
 
@@ -249,9 +273,13 @@ def train(
     device_name: str | None = None,
     amp: str = "auto",
     num_workers: int = 4,
+    pin_memory: bool | None = None,
     clip_grad: float = 0.0,
     log_interval: int = 20,
     max_batches: int | None = None,
+    measure_efficiency: bool = False,
+    efficiency_output: str | Path = "outputs/runs/awsnet/efficiency_metrics.json",
+    efficiency_only: bool = False,
 ) -> Path:
     """Runs standard 300-epoch training strictly conforming to Promt_train_test_no_val.txt."""
     resolved_data = resolve_data_root(data_dir)
@@ -264,20 +292,110 @@ def train(
 
     manifest_hash = compute_manifest_hash(train_manifest)
 
-    # 1. Device and precision resolution
+    # 1. Device, precision, and DataLoader pin_memory resolution
     if device_name is not None:
         device = torch.device(device_name)
     else:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     amp_dtype = resolve_amp(amp, device)
-    print(f"[AWSnet] Execution device: {device} | AMP mode: {amp} (dtype: {amp_dtype})")
+    effective_pin_memory = (device.type == "cuda") if pin_memory is None else bool(pin_memory)
+    print(
+        f"[AWSnet] Execution device: {device} | AMP mode: {amp} (dtype: {amp_dtype}) | "
+        f"num_workers: {num_workers} | pin_memory: {effective_pin_memory}"
+    )
+
+    rule_compliant, compliance_warnings, hardware_info = check_rule_compliance(
+        device=device,
+        amp_mode=amp,
+        num_workers=num_workers,
+        pin_memory=effective_pin_memory,
+        batch_size=batch_size,
+        planned_epochs=max_epochs,
+    )
+    if measure_efficiency or efficiency_only:
+        print(
+            f"[AWSnet Efficiency] GPU: {hardware_info['gpu_name']} (count={hardware_info['visible_gpu_count']}) | "
+            f"Precision: {hardware_info['precision']} | num_workers: {num_workers} | "
+            f"pin_memory: {effective_pin_memory} | batch: {batch_size} | epochs: {max_epochs}"
+        )
+        if not rule_compliant:
+            for warn_msg in compliance_warnings:
+                print(f"[AWSnet WARNING - EFFICIENCY RULE MISMATCH] {warn_msg}")
 
     # 2. Seed & Determinism
     set_seed(seed=seed, deterministic=True)
     g = torch.Generator()
     g.manual_seed(seed)
 
-    # 3. Training Dataset & DataLoader (Strictly NO validation loader)
+    # 3. Model initialization on CPU first, then check checkpoint before creating optimizer
+    ckpt_filename = f"awsnet_seed{seed}.pt"
+    ckpt_path = resolved_save / ckpt_filename
+    resume_target = Path(resume) if (resume and resume != "auto") else ckpt_path
+    should_resume = (resume and resume != "auto") or (resume == "auto" and resume_target.is_file())
+
+    model = AWSnet(
+        in_channels=3,
+        num_classes=4,
+        base_filters=base_filters,
+        deep_supervision=True,
+    )
+
+    resume_ckpt: dict[str, Any] | None = None
+    if should_resume:
+        if not resume_target.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_target}")
+        print(f"[AWSnet] Loading checkpoint metadata from: {resume_target}")
+        resume_ckpt = torch.load(resume_target, map_location="cpu", weights_only=False)
+        resumed_epoch = int(resume_ckpt.get("completed_epochs", resume_ckpt.get("epoch", 0)))
+        if resumed_epoch >= max_epochs and not efficiency_only:
+            print(f"[AWSnet] Checkpoint already completed full budget ({resumed_epoch}/{max_epochs} epochs).")
+            return ckpt_path
+        model.load_state_dict(resume_ckpt["model_state"])
+
+    model = model.float().to(device)
+    params_info = count_efficiency_parameters(model)
+    total_params = params_info["trainable_params"]
+    print(f"[AWSnet] Instantiated AWSnet (Trainable parameters: {total_params:,} | Total: {params_info['total_params']:,})")
+
+    efficiency_json_targets = _dedupe_paths(
+        [Path(efficiency_output), resolved_save / "efficiency_metrics.json"]
+    )
+    efficiency_summary_targets = _dedupe_paths([resolved_save / f"efficiency_summary_seed{seed}.txt"])
+
+    # Measure Complexity & Batch=1 Inference cleanly BEFORE optimizer states allocate GPU memory
+    flops_info: dict[str, Any] | None = None
+    inference_info: dict[str, Any] | None = None
+    if measure_efficiency or efficiency_only:
+        print("[AWSnet Efficiency] Measuring Complexity (FP32 FLOPs on 1x3x128x128 eval) & Inference (B=1)...")
+        flops_info = measure_flops(model, input_shape=(1, 3, 128, 128), device=device)
+        inference_info = measure_inference_efficiency(
+            model, input_shape=(1, 3, 128, 128), device=device, warmup=30, repeats=100
+        )
+        print(
+            f"[AWSnet Efficiency] Complexity | Trainable Params: {params_info['trainable_params_m']:.2f}M "
+            f"(Total: {params_info['total_params_m']:.2f}M) | FLOPs: {flops_info['flops_g']:.2f} G"
+        )
+        print(
+            f"[AWSnet Efficiency] Inference (B=1, FP32) | Latency: {inference_info['latency_ms_per_slice']:.2f} ms/slice | "
+            f"Peak VRAM: {inference_info['peak_vram_mb']:.2f} MB ({inference_info['peak_vram_gb']:.4f} GB)"
+        )
+        if efficiency_only:
+            payload = build_efficiency_payload(
+                model_name="AWSnet",
+                model_id="awsnet",
+                seed=seed,
+                params_info=params_info,
+                flops_info=flops_info,
+                inference_info=inference_info,
+                training_info=None,
+                rule_compliant=rule_compliant,
+                compliance_warnings=compliance_warnings,
+                hardware_info=hardware_info,
+            )
+            save_efficiency_report(payload, efficiency_json_targets, efficiency_summary_targets)
+            return ckpt_path
+
+    # 4. Training Dataset & DataLoader (Strictly NO validation loader)
     train_dataset = MyoPS380TrainDataset(
         data_dir=resolved_data,
         split_dir=resolved_split,
@@ -291,7 +409,7 @@ def train(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=effective_pin_memory,
         drop_last=False,  # Keep all 1,972 slices
         persistent_workers=False,
         worker_init_fn=seed_worker,
@@ -314,16 +432,11 @@ def train(
         f"  - manifest_hash (train.txt): {manifest_hash[:16]}..."
     )
 
-    # 4. Model initialization
-    model = AWSnet(
-        in_channels=3,
-        num_classes=4,
-        base_filters=base_filters,
-        deep_supervision=True,
-    ).to(device)
-
-    total_params = count_parameters(model)
-    print(f"[AWSnet] Instantiated AWSnet (Trainable parameters: {total_params:,})")
+    # Clear CUDA cache & reset peak VRAM right before creating training state
+    gc.collect()
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
 
     # 5. Optimization & Scheduling (AdamW + Polynomial Decay)
     optimizer = build_optimizer(model, base_lr=base_lr, weight_decay=weight_decay)
@@ -336,56 +449,54 @@ def train(
     global_step = 0
     successful_updates = 0
     cumulative_skipped = 0
-    history = []
+    history: list[dict[str, Any]] = []
+    epoch_times: list[float] = []
+    prev_wall_clock_s = 0.0
+    max_train_peak_vram_bytes = 0
+    max_train_reserved_bytes = 0
 
-    # 6. Resume handling
-    ckpt_filename = f"awsnet_seed{seed}.pt"
-    ckpt_path = resolved_save / ckpt_filename
+    # 6. Restore optimizer/scheduler/RNG/efficiency state if resuming
+    if resume_ckpt is not None:
+        print(f"[AWSnet] Resuming optimizer, scheduler, and RNG states from: {resume_target}")
+        optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+        scheduler.load_state_dict(resume_ckpt["scheduler_state"])
+        if scaler and "scaler_state" in resume_ckpt and resume_ckpt["scaler_state"] and scaler.is_enabled():
+            scaler.load_state_dict(resume_ckpt["scaler_state"])
 
-    resume_target = Path(resume) if (resume and resume != "auto") else ckpt_path
-    if (resume and resume != "auto") or (resume == "auto" and resume_target.is_file()):
-        if not resume_target.is_file():
-            raise FileNotFoundError(f"Resume checkpoint not found: {resume_target}")
-        print(f"[AWSnet] Resuming from checkpoint: {resume_target}")
-        checkpoint = torch.load(resume_target, map_location=device, weights_only=False)
+        start_epoch = int(resume_ckpt.get("completed_epochs", resume_ckpt.get("epoch", 0)))
+        global_step = int(resume_ckpt.get("global_step", start_epoch * updates_per_epoch))
+        successful_updates = int(resume_ckpt.get("successful_updates", global_step))
+        cumulative_skipped = int(resume_ckpt.get("amp_skipped_updates", 0))
+        history = list(resume_ckpt.get("history", []))
+        epoch_times = [float(t) for t in resume_ckpt.get("epoch_times", [h.get("epoch_wall_time", 0.0) for h in history])][:start_epoch]
+        prev_wall_clock_s = float(resume_ckpt.get("total_wall_clock_seconds", 0.0))
+        max_train_peak_vram_bytes = int(resume_ckpt.get("train_peak_vram_bytes", 0))
+        max_train_reserved_bytes = int(resume_ckpt.get("train_peak_reserved_bytes", 0))
 
-        model.load_state_dict(checkpoint["model_state"])
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        scheduler.load_state_dict(checkpoint["scheduler_state"])
-        if scaler and "scaler_state" in checkpoint and checkpoint["scaler_state"] and scaler.is_enabled():
-            scaler.load_state_dict(checkpoint["scaler_state"])
-
-        start_epoch = checkpoint.get("completed_epochs", checkpoint.get("epoch", 0))
-        global_step = checkpoint.get("global_step", start_epoch * updates_per_epoch)
-        successful_updates = checkpoint.get("successful_updates", global_step)
-        cumulative_skipped = checkpoint.get("amp_skipped_updates", 0)
-        history = checkpoint.get("history", [])
-
-        if "rng_state_torch" in checkpoint:
-            torch.set_rng_state(checkpoint["rng_state_torch"])
-        if "rng_state_numpy" in checkpoint:
-            np.random.set_state(checkpoint["rng_state_numpy"])
-        if "rng_state_python" in checkpoint:
-            random.setstate(checkpoint["rng_state_python"])
-        if torch.cuda.is_available() and "rng_state_cuda" in checkpoint and checkpoint["rng_state_cuda"] is not None:
-            torch.cuda.set_rng_state_all(checkpoint["rng_state_cuda"])
-        if "loader_rng" in checkpoint and checkpoint["loader_rng"] is not None:
-            g.set_state(checkpoint["loader_rng"])
+        # Cast RNG ByteTensors to CPU cleanly to avoid CUDA ByteTensor errors
+        if "rng_state_torch" in resume_ckpt and resume_ckpt["rng_state_torch"] is not None:
+            torch.set_rng_state(resume_ckpt["rng_state_torch"].cpu())
+        if "rng_state_numpy" in resume_ckpt:
+            np.random.set_state(resume_ckpt["rng_state_numpy"])
+        if "rng_state_python" in resume_ckpt:
+            random.setstate(resume_ckpt["rng_state_python"])
+        if torch.cuda.is_available() and "rng_state_cuda" in resume_ckpt and resume_ckpt["rng_state_cuda"] is not None:
+            torch.cuda.set_rng_state_all([s.cpu() for s in resume_ckpt["rng_state_cuda"]])
+        if "loader_rng" in resume_ckpt and resume_ckpt["loader_rng"] is not None:
+            g.set_state(resume_ckpt["loader_rng"].cpu())
 
         print(
             f"[AWSnet] Resumed at epoch {start_epoch}, global_step {global_step} "
             f"(successful {successful_updates}, skipped {cumulative_skipped})"
         )
-
-    if start_epoch >= max_epochs:
-        print(f"[AWSnet] Checkpoint already completed full budget ({start_epoch}/{max_epochs} epochs).")
-        return ckpt_path
+        del resume_ckpt
 
     # 7. Training loop (Strictly NO validation)
     print(f"\n[AWSnet] Starting training for {max_epochs - start_epoch} epochs...")
     total_training_start = time.perf_counter()
 
     for epoch in range(start_epoch, max_epochs):
+        sync_if_cuda(device)
         epoch_start = time.perf_counter()
         metrics, global_step, successful_updates, skipped_steps = train_epoch(
             model=model,
@@ -404,8 +515,16 @@ def train(
             log_interval=log_interval,
             max_batches=max_batches,
         )
+        sync_if_cuda(device)
         cumulative_skipped += skipped_steps
         epoch_duration = time.perf_counter() - epoch_start
+        epoch_times.append(epoch_duration)
+
+        if device.type == "cuda" and torch.cuda.is_available():
+            max_train_peak_vram_bytes = max(max_train_peak_vram_bytes, int(torch.cuda.max_memory_allocated(device)))
+            max_train_reserved_bytes = max(max_train_reserved_bytes, int(torch.cuda.max_memory_reserved(device)))
+
+        total_wall_clock_s = prev_wall_clock_s + (time.perf_counter() - total_training_start)
         metrics["epoch"] = epoch + 1
         metrics["epoch_wall_time"] = epoch_duration
         history.append(metrics)
@@ -437,6 +556,8 @@ def train(
             "amp_skipped_updates": cumulative_skipped,
             "amp_mode": amp,
             "amp_dtype": str(amp_dtype),
+            "num_workers": num_workers,
+            "pin_memory": effective_pin_memory,
             "seed": seed,
             "batch_size": batch_size,
             "accum_steps": accum_steps,
@@ -446,6 +567,10 @@ def train(
             "trainable_parameters": total_params,
             "manifest_hash": manifest_hash,
             "optimization_protocol": OPTIMIZATION_PROTOCOL,
+            "epoch_times": epoch_times,
+            "total_wall_clock_seconds": total_wall_clock_s,
+            "train_peak_vram_bytes": max_train_peak_vram_bytes,
+            "train_peak_reserved_bytes": max_train_reserved_bytes,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
@@ -482,6 +607,8 @@ def train(
         "amp_skipped_updates": cumulative_skipped,
         "amp_mode": amp,
         "amp_dtype": str(amp_dtype),
+        "num_workers": num_workers,
+        "pin_memory": effective_pin_memory,
         "trainable_parameters": total_params,
         "total_training_seconds": total_training_duration,
         "final_loss": history[-1]["loss"] if history else None,
@@ -489,6 +616,30 @@ def train(
     }
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary_data, f, indent=2)
+
+    if measure_efficiency and flops_info is not None and inference_info is not None:
+        final_wall_clock_s = prev_wall_clock_s + total_training_duration
+        training_info = summarize_training_efficiency(
+            epoch_times_s=epoch_times,
+            total_wall_clock_s=final_wall_clock_s,
+            peak_vram_bytes=max_train_peak_vram_bytes,
+            planned_epochs=max_epochs,
+            warmup_epochs=5,
+            peak_reserved_bytes=max_train_reserved_bytes,
+        )
+        payload = build_efficiency_payload(
+            model_name="AWSnet",
+            model_id="awsnet",
+            seed=seed,
+            params_info=params_info,
+            flops_info=flops_info,
+            inference_info=inference_info,
+            training_info=training_info,
+            rule_compliant=rule_compliant,
+            compliance_warnings=compliance_warnings,
+            hardware_info=hardware_info,
+        )
+        save_efficiency_report(payload, efficiency_json_targets, efficiency_summary_targets)
 
     return ckpt_path
 
@@ -514,12 +665,36 @@ def parse_args():
         help="Path to checkpoint to resume from, or pass without value to resume from default checkpoint"
     )
     parser.add_argument("--device", type=str, default=None, help="Execution device (e.g. cuda:0 or cpu)")
-    parser.add_argument("--num_workers", "--num-workers", dest="num_workers", type=int, default=4, help="DataLoader workers count (default: 4)")
+    parser.add_argument("--num_workers", "--num-workers", dest="num_workers", type=int, default=4, help="DataLoader workers count (default: 4; use 0 for efficiency benchmark)")
+    parser.add_argument("--pin_memory", "--pin-memory", dest="pin_memory", action=argparse.BooleanOptionalAction, default=None, help="Pin host memory for CUDA transfers (default: True on CUDA)")
     parser.add_argument("--log_interval", "--log-every", dest="log_interval", type=int, default=20, help="Batch logging interval")
     parser.add_argument("--amp", type=str, default="auto", choices=["auto", "none", "fp16", "bf16"], help="Mixed precision mode (default: auto)")
     parser.add_argument("--clip_grad", "--clip-grad", dest="clip_grad", type=float, default=0.0, help="Gradient clipping norm (0.0 to disable)")
     parser.add_argument("--config", type=str, default=None, help="Optional YAML config path (for compatibility with SCAR launch scripts)")
     parser.add_argument("--max_batches", type=int, default=None, help="Max batches per epoch (for quick testing)")
+    parser.add_argument(
+        "--measure_efficiency",
+        "--measure-efficiency",
+        dest="measure_efficiency",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Measure Complexity, Inference, and Training efficiency metrics and export JSON (default: False)",
+    )
+    parser.add_argument(
+        "--efficiency_output",
+        "--efficiency-output",
+        dest="efficiency_output",
+        type=str,
+        default="outputs/runs/awsnet/efficiency_metrics.json",
+        help="Primary JSON output path for efficiency metrics",
+    )
+    parser.add_argument(
+        "--efficiency_only",
+        "--efficiency-only",
+        dest="efficiency_only",
+        action="store_true",
+        help="Measure Complexity + Inference efficiency only (skip training loop)",
+    )
     return parser.parse_args()
 
 
@@ -540,7 +715,11 @@ if __name__ == "__main__":
         device_name=args.device,
         amp=args.amp,
         num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
         clip_grad=args.clip_grad,
         log_interval=args.log_interval,
         max_batches=args.max_batches,
+        measure_efficiency=args.measure_efficiency,
+        efficiency_output=args.efficiency_output,
+        efficiency_only=args.efficiency_only,
     )
